@@ -217,10 +217,8 @@ def ejecutar_accion(accion, texto_cliente):
     return f"Accion desconocida: {tipo}"
 
 
-def llamar_ollama(mensajes, formato=None, mostrar=False):
-    """Envia mensajes a Ollama y devuelve el texto de la respuesta.
-
-    Con mostrar=True imprime la respuesta mientras llega."""
+def trozos_ollama(mensajes, formato=None):
+    """Envia mensajes a Ollama y va devolviendo la respuesta a trozos, segun llega."""
     datos = {
         "model": MODELO,
         "messages": mensajes,
@@ -232,7 +230,6 @@ def llamar_ollama(mensajes, formato=None, mostrar=False):
     body = json.dumps(datos).encode("utf-8")
     req = urllib.request.Request(URL, data=body, headers={"Content-Type": "application/json"})
 
-    respuesta = ""
     with urllib.request.urlopen(req, timeout=300) as r:
         # Con stream=True, Ollama manda un objeto JSON por linea
         for linea in r:
@@ -241,12 +238,20 @@ def llamar_ollama(mensajes, formato=None, mostrar=False):
             parte = json.loads(linea)
             if "error" in parte:
                 raise RuntimeError(parte["error"])
-            trozo = parte.get("message", {}).get("content", "")
-            if mostrar:
-                print(trozo, end="", flush=True)
-            respuesta += trozo
+            yield parte.get("message", {}).get("content", "")
             if parte.get("done"):
                 break
+
+
+def llamar_ollama(mensajes, formato=None, mostrar=False):
+    """Envia mensajes a Ollama y devuelve el texto de la respuesta.
+
+    Con mostrar=True imprime la respuesta mientras llega."""
+    respuesta = ""
+    for trozo in trozos_ollama(mensajes, formato):
+        if mostrar:
+            print(trozo, end="", flush=True)
+        respuesta += trozo
     return respuesta
 
 
@@ -265,11 +270,10 @@ def para_modelo(historial, con_acciones):
     return mensajes
 
 
-def responder(historial):
-    """Procesa el ultimo mensaje del cliente: ejecuta las acciones y escribe la respuesta.
+def ejecutar_acciones(historial):
+    """Paso 1: el modelo decide las acciones (JSON con formato fijo) y Python las ejecuta.
 
-    Devuelve (respuesta, resultados_de_las_acciones)."""
-    # Paso 1: decidir acciones (JSON con formato fijo)
+    Devuelve la lista de resultados."""
     sistema_acciones = INSTRUCCIONES_ACCIONES + f"\n\nPedido actual: {resumen_pedido()}"
     decision = llamar_ollama(
         [{"role": "system", "content": sistema_acciones}] + para_modelo(historial, con_acciones=True),
@@ -278,29 +282,39 @@ def responder(historial):
     acciones = json.loads(decision).get("acciones", [])
 
     texto_cliente = "\n".join(m["content"] for m in historial if m["role"] == "user")
-    resultados = []
-    for accion in acciones:
-        resultado = ejecutar_accion(accion, texto_cliente)
-        resultados.append(resultado)
-        print(f"  [{resultado}]")
+    return [ejecutar_accion(accion, texto_cliente) for accion in acciones]
 
-    if any(r.startswith("Pedido CONFIRMADO") for r in resultados):
-        respuesta = mensaje_confirmacion(ultimo_confirmado)
-        print(f"Bot: {respuesta}", end="")
-        return respuesta, resultados
 
-    # Paso 2: escribir la respuesta con los datos reales
+def hay_confirmacion(resultados):
+    return any(r.startswith("Pedido CONFIRMADO") for r in resultados)
+
+
+def mensajes_respuesta(historial, resultados):
+    """Paso 2: mensajes para que el modelo escriba la respuesta con los datos reales."""
     sistema_respuesta = (
         INSTRUCCIONES_RESPUESTA
         + f"\n\nEstado del pedido: {resumen_pedido()}"
         + "\nAcciones realizadas con el ultimo mensaje: "
         + (" | ".join(resultados) if resultados else "ninguna")
     )
+    return [{"role": "system", "content": sistema_respuesta}] + para_modelo(historial, con_acciones=False)
+
+
+def responder(historial):
+    """Procesa el ultimo mensaje del cliente: ejecuta las acciones y escribe la respuesta.
+
+    Devuelve (respuesta, resultados_de_las_acciones)."""
+    resultados = ejecutar_acciones(historial)
+    for resultado in resultados:
+        print(f"  [{resultado}]")
+
+    if hay_confirmacion(resultados):
+        respuesta = mensaje_confirmacion(ultimo_confirmado)
+        print(f"Bot: {respuesta}", end="")
+        return respuesta, resultados
+
     print("Bot: ", end="", flush=True)
-    respuesta = llamar_ollama(
-        [{"role": "system", "content": sistema_respuesta}] + para_modelo(historial, con_acciones=False),
-        mostrar=True,
-    )
+    respuesta = llamar_ollama(mensajes_respuesta(historial, resultados), mostrar=True)
     return respuesta, resultados
 
 
@@ -347,7 +361,7 @@ def main():
         historial.append({"role": "assistant", "content": respuesta, "acciones": resultados})
         print("\n")
         # Pedido terminado: se empieza de cero para que el modelo no repita ese pedido
-        if any(r.startswith("Pedido CONFIRMADO") for r in resultados):
+        if hay_confirmacion(resultados):
             historial[:] = [{"role": "assistant", "content": "(El pedido anterior ya esta confirmado y cerrado.)"}]
 
     if pedido:
