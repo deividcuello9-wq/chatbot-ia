@@ -1,8 +1,9 @@
 """Pagina web de chat para el chatbot de Pizza Nova.
 
-Uso:
-    ollama serve
-    ~/.venvs/pizzanova/bin/streamlit run pizzanova_web.py
+Uso en tu Mac (con Ollama):
+    ./iniciar_demo.sh
+
+En Streamlit Community Cloud se usa OpenAI: pon OPENAI_API_KEY en los "Secrets" de la app.
 """
 import json
 import os
@@ -11,9 +12,22 @@ import urllib.error
 
 import streamlit as st
 
-import chatbot
+# En Streamlit Cloud la API key esta en los Secrets; se pasa a chatbot.py como variable de entorno
+try:
+    if "OPENAI_API_KEY" in st.secrets:
+        os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+    if "OPENAI_MODEL" in st.secrets:
+        os.environ["OPENAI_MODEL"] = st.secrets["OPENAI_MODEL"]
+except FileNotFoundError:
+    pass  # sin archivo de secrets: se usa Ollama
+
+import chatbot  # noqa: E402  (despues de leer los secrets)
 
 st.set_page_config(page_title="Pizza Nova", page_icon="🍕", layout="wide")
+
+# Limites para que la pagina publica no se use para gastar la API
+MAX_LETRAS = 500
+MAX_MENSAJES_VISITA = 40
 
 BIENVENIDA = (
     "¡Hola! 👋 Bienvenido a **Pizza Nova**. Puedo enseñarte el menú y tomar tu pedido, "
@@ -99,9 +113,14 @@ for m in ss.chat:
     with st.chat_message(m["role"], avatar="🍕" if m["role"] == "assistant" else "🙂"):
         st.markdown(m["content"])
 
-pregunta = st.chat_input("Escribe tu mensaje… (ej: quiero 2 pepperoni)")
+mensajes_enviados = sum(1 for m in ss.chat if m["role"] == "user")
+if mensajes_enviados >= MAX_MENSAJES_VISITA:
+    st.info("Has llegado al límite de mensajes de esta demo. Pulsa 🔄 Empezar de nuevo para seguir.")
+    pregunta = None
+else:
+    pregunta = st.chat_input("Escribe tu mensaje… (ej: quiero 2 pepperoni)", max_chars=MAX_LETRAS)
 if pregunta:
-    pregunta = pregunta.strip()
+    pregunta = pregunta.strip()[:MAX_LETRAS]
     ss.chat.append({"role": "user", "content": pregunta})
     with st.chat_message("user", avatar="🙂"):
         st.markdown(pregunta)
@@ -121,12 +140,25 @@ if pregunta:
                     st.markdown(respuesta)
                 else:
                     respuesta = st.write_stream(
-                        chatbot.trozos_ollama(chatbot.mensajes_respuesta(ss.historial, resultados))
+                        chatbot.trozos_ia(chatbot.mensajes_respuesta(ss.historial, resultados))
                     )
+        except urllib.error.HTTPError as e:
+            ss.historial.pop()
+            ss.chat.pop()
+            if e.code == 401:
+                st.error("La API key de OpenAI no es válida. Revísala en los Secrets de la app.")
+            elif e.code == 429:
+                st.error("La IA está saturada o se acabó el saldo de la API. Inténtalo en un momento.")
+            else:
+                st.error(f"Error de {chatbot.PROVEEDOR} ({e.code}). Inténtalo de nuevo.")
+            st.stop()
         except (urllib.error.URLError, ConnectionError, TimeoutError):
             ss.historial.pop()
             ss.chat.pop()
-            st.error("No pude conectar con la IA. Comprueba que Ollama esté abierto (`ollama serve`).")
+            if chatbot.PROVEEDOR == "Ollama":
+                st.error("No pude conectar con la IA. Comprueba que Ollama esté abierto (`ollama serve`).")
+            else:
+                st.error("No pude conectar con OpenAI. Inténtalo de nuevo en un momento.")
             st.stop()
         except (RuntimeError, json.JSONDecodeError) as e:
             ss.historial.pop()

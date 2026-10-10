@@ -5,8 +5,17 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 
-URL = "http://localhost:11434/api/chat"
-MODELO = os.environ.get("OLLAMA_MODEL", "qwen2.5:14b")
+# Si hay una API key de OpenAI se usa OpenAI (para publicarlo en internet);
+# si no, Ollama en este ordenador.
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+if OPENAI_API_KEY:
+    PROVEEDOR = "OpenAI"
+    URL = "https://api.openai.com/v1/chat/completions"
+    MODELO = os.environ.get("OPENAI_MODEL", "gpt-6-luna")
+else:
+    PROVEEDOR = "Ollama"
+    URL = "http://localhost:11434/api/chat"
+    MODELO = os.environ.get("OLLAMA_MODEL", "qwen2.5:14b")
 MAX_MENSAJES = 20  # mensajes recientes que se envian al modelo
 ARCHIVO_PEDIDOS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pedidos.json")
 
@@ -71,16 +80,19 @@ ESQUEMA_ACCIONES = {
                 "type": "object",
                 "properties": {
                     "accion": {"type": "string", "enum": ["agregar", "quitar", "confirmar"]},
-                    "pizza": {"type": "string"},
-                    "cantidad": {"type": "integer"},
-                    "nombre": {"type": "string"},
-                    "direccion": {"type": "string"},
+                    "pizza": {"type": ["string", "null"]},
+                    "cantidad": {"type": ["integer", "null"]},
+                    "nombre": {"type": ["string", "null"]},
+                    "direccion": {"type": ["string", "null"]},
                 },
-                "required": ["accion"],
+                # OpenAI exige que todos los campos esten en "required" (los que no apliquen van como null)
+                "required": ["accion", "pizza", "cantidad", "nombre", "direccion"],
+                "additionalProperties": False,
             },
         }
     },
     "required": ["acciones"],
+    "additionalProperties": False,
 }
 
 pedido = {}  # nombre de pizza -> cantidad
@@ -209,16 +221,23 @@ def mensaje_confirmacion(registro):
 def ejecutar_accion(accion, texto_cliente):
     tipo = accion.get("accion")
     if tipo == "agregar":
-        return agregar_pizza(accion.get("pizza", ""), accion.get("cantidad", 1))
+        return agregar_pizza(accion.get("pizza") or "", accion.get("cantidad") or 1)
     if tipo == "quitar":
-        return quitar_pizza(accion.get("pizza", ""), accion.get("cantidad", 1))
+        return quitar_pizza(accion.get("pizza") or "", accion.get("cantidad") or 1)
     if tipo == "confirmar":
-        return confirmar_pedido(accion.get("nombre", ""), accion.get("direccion", ""), texto_cliente)
+        return confirmar_pedido(accion.get("nombre") or "", accion.get("direccion") or "", texto_cliente)
     return f"Accion desconocida: {tipo}"
 
 
+def trozos_ia(mensajes, formato=None):
+    """Envia mensajes a la IA y va devolviendo la respuesta a trozos, segun llega."""
+    if PROVEEDOR == "OpenAI":
+        yield from trozos_openai(mensajes, formato)
+    else:
+        yield from trozos_ollama(mensajes, formato)
+
+
 def trozos_ollama(mensajes, formato=None):
-    """Envia mensajes a Ollama y va devolviendo la respuesta a trozos, segun llega."""
     datos = {
         "model": MODELO,
         "messages": mensajes,
@@ -243,12 +262,42 @@ def trozos_ollama(mensajes, formato=None):
                 break
 
 
-def llamar_ollama(mensajes, formato=None, mostrar=False):
-    """Envia mensajes a Ollama y devuelve el texto de la respuesta.
+def trozos_openai(mensajes, formato=None):
+    datos = {"model": MODELO, "messages": mensajes, "stream": True}
+    if formato:
+        datos["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": "acciones", "schema": formato, "strict": True},
+        }
+    body = json.dumps(datos).encode("utf-8")
+    req = urllib.request.Request(
+        URL,
+        data=body,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {OPENAI_API_KEY}"},
+    )
+
+    with urllib.request.urlopen(req, timeout=120) as r:
+        # OpenAI manda lineas "data: {...}" y termina con "data: [DONE]"
+        for linea in r:
+            linea = linea.decode("utf-8").strip()
+            if not linea.startswith("data:"):
+                continue
+            dato = linea[len("data:"):].strip()
+            if dato == "[DONE]":
+                break
+            parte = json.loads(dato)
+            if "error" in parte:
+                raise RuntimeError(parte["error"].get("message", parte["error"]))
+            for opcion in parte.get("choices", []):
+                yield opcion.get("delta", {}).get("content") or ""
+
+
+def llamar_ia(mensajes, formato=None, mostrar=False):
+    """Envia mensajes a la IA y devuelve el texto de la respuesta.
 
     Con mostrar=True imprime la respuesta mientras llega."""
     respuesta = ""
-    for trozo in trozos_ollama(mensajes, formato):
+    for trozo in trozos_ia(mensajes, formato):
         if mostrar:
             print(trozo, end="", flush=True)
         respuesta += trozo
@@ -256,7 +305,7 @@ def llamar_ollama(mensajes, formato=None, mostrar=False):
 
 
 def para_modelo(historial, con_acciones):
-    """Prepara los mensajes recientes para Ollama.
+    """Prepara los mensajes recientes para la IA.
 
     Con con_acciones=True, cada respuesta del bot lleva delante las acciones que ya se hicieron,
     para que el modelo no repita acciones de mensajes anteriores."""
@@ -275,7 +324,7 @@ def ejecutar_acciones(historial):
 
     Devuelve la lista de resultados."""
     sistema_acciones = INSTRUCCIONES_ACCIONES + f"\n\nPedido actual: {resumen_pedido()}"
-    decision = llamar_ollama(
+    decision = llamar_ia(
         [{"role": "system", "content": sistema_acciones}] + para_modelo(historial, con_acciones=True),
         formato=ESQUEMA_ACCIONES,
     )
@@ -296,6 +345,8 @@ def mensajes_respuesta(historial, resultados):
         + f"\n\nEstado del pedido: {resumen_pedido()}"
         + "\nAcciones realizadas con el ultimo mensaje: "
         + (" | ".join(resultados) if resultados else "ninguna")
+        + "\nIMPORTANTE: el pedido NO esta confirmado todavia. No digas que esta confirmado; "
+        "si el cliente ya pidio pizzas, pidele su nombre y si es para recoger o a domicilio."
     )
     return [{"role": "system", "content": sistema_respuesta}] + para_modelo(historial, con_acciones=False)
 
@@ -314,13 +365,13 @@ def responder(historial):
         return respuesta, resultados
 
     print("Bot: ", end="", flush=True)
-    respuesta = llamar_ollama(mensajes_respuesta(historial, resultados), mostrar=True)
+    respuesta = llamar_ia(mensajes_respuesta(historial, resultados), mostrar=True)
     return respuesta, resultados
 
 
 def main():
     historial = []
-    print(f"Chatbot Pizza Nova listo (modelo: {MODELO}). Escribe 'salir' para terminar.")
+    print(f"Chatbot Pizza Nova listo ({PROVEEDOR}, modelo: {MODELO}). Escribe 'salir' para terminar.")
     print("Puedes preguntar por el menu o hacer tu pedido.\n")
 
     while True:
@@ -344,13 +395,17 @@ def main():
             historial.pop()
             continue
         except urllib.error.HTTPError as e:
-            print(f"\n[Error de Ollama {e.code}: {e.read().decode('utf-8', 'ignore')}]")
-            print(f"[Comprueba que el modelo existe: ollama pull {MODELO}]\n")
+            print(f"\n[Error de {PROVEEDOR} {e.code}: {e.read().decode('utf-8', 'ignore')}]")
+            if PROVEEDOR == "Ollama":
+                print(f"[Comprueba que el modelo existe: ollama pull {MODELO}]")
+            print()
             historial.pop()
             continue
         except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
-            print(f"\n[No pude conectar con Ollama: {e}]")
-            print("[Comprueba que este corriendo con: ollama serve]\n")
+            print(f"\n[No pude conectar con {PROVEEDOR}: {e}]")
+            if PROVEEDOR == "Ollama":
+                print("[Comprueba que este corriendo con: ollama serve]")
+            print()
             historial.pop()
             continue
         except (RuntimeError, json.JSONDecodeError) as e:
